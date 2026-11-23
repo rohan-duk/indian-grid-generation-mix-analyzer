@@ -150,3 +150,199 @@ class GridGenerationMixAnalyzer:
         self._last_shannon = out
         return out
 
+    def compare_clean_and_deficit_days(self, clean_cutoff=0.40, deficit_cutoff=1000.0):
+        """Compare days with clean energy > 40% vs peak deficit > 1000 MW using boolean masks.
+
+        Args:
+            clean_cutoff (float): Clean share threshold (default 0.40).
+            deficit_cutoff (float): Peak deficit threshold in MW (default 1000.0).
+
+        Returns:
+            dict: Counts and percentages of flagged days plus Python set check.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        clean_ratio = self.__data["clean_energy_ratio"].to_numpy(dtype=float)
+        deficit_mw = self.__data["Deficit_MW"].to_numpy(dtype=float)
+
+        mask_clean = clean_ratio > clean_cutoff
+        mask_deficit = deficit_mw > deficit_cutoff
+        mask_both = mask_clean & mask_deficit
+
+        set_clean = set(np.where(mask_clean)[0].tolist())
+        set_deficit = set(np.where(mask_deficit)[0].tolist())
+        set_match = (len(set_clean & set_deficit) == int(np.sum(mask_both)))
+
+        total = len(clean_ratio)
+        return {
+            "total_records": total,
+            "high_clean_count": int(np.sum(mask_clean)),
+            "high_clean_pct": round(float(np.mean(mask_clean) * 100), 2),
+            "high_deficit_count": int(np.sum(mask_deficit)),
+            "high_deficit_pct": round(float(np.mean(mask_deficit) * 100), 2),
+            "both_count": int(np.sum(mask_both)),
+            "set_check_passed": bool(set_match),
+        }
+
+    def fit_hydro_thermal_ols(self):
+        """Fit OLS regression Thermal_Gen = b0 + b1*Hydro_Gen + b2*Peak_Demand.
+
+        Returns:
+            dict: Intercept, slopes, R2 score, RSS, and hydro-thermal elasticity.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        hydro = self.__data["Hydro_Gen_MU"].to_numpy(dtype=float)
+        demand = self.__data["Peak_Demand_MW"].to_numpy(dtype=float)
+        thermal = self.__data["Thermal_Gen_MU"].to_numpy(dtype=float)
+
+        X = np.column_stack([np.ones(len(hydro)), hydro, demand])
+        beta, _, _, _ = np.linalg.lstsq(X, thermal, rcond=None)
+        preds = X @ beta
+
+        rss = float(np.sum((thermal - preds) ** 2))
+        tss = float(np.sum((thermal - np.mean(thermal)) ** 2))
+        r2 = 1.0 - (rss / tss) if tss > 0 else 0.0
+
+        elasticity = float(beta[1] * (np.mean(hydro) / np.mean(thermal)))
+
+        return {
+            "b0_intercept": round(float(beta[0]), 4),
+            "b1_hydro": round(float(beta[1]), 4),
+            "b2_demand": round(float(beta[2]), 4),
+            "r2": round(r2, 4),
+            "rss": round(rss, 2),
+            "substitution_elasticity": round(elasticity, 4),
+        }
+
+
+    def check_completeness_and_growth(self):
+        """Quantify missing regional records and compute annual generation growth (Q7).
+
+        Returns:
+            dict: Completeness summary DataFrame and annual growth DataFrame.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        df = self.__data.copy()
+
+        # Rolling 7-day median baseline on Total_Gen_MU to flag sudden spikes
+        df["rolling_7d_median"] = (
+            df.groupby("Region")["Total_Gen_MU"]
+            .transform(lambda s: s.rolling(window=7, min_periods=1).median())
+        )
+        df["spike_flag"] = df["Total_Gen_MU"] > (1.25 * df["rolling_7d_median"])
+
+        full_days = int((df["Date"].max() - df["Date"].min()).days) + 1
+        completeness = df.groupby("Region").agg(
+            recorded_days=("Date", lambda s: s.dt.date.nunique()),
+            missing_demand_count=("Peak_Demand_MW", lambda s: int(s.isna().sum())),
+            spike_days=("spike_flag", "sum"),
+        )
+        completeness["missing_days"] = (full_days - completeness["recorded_days"]).clip(lower=0)
+
+        annual_totals = df.groupby(["Region", "Year"])["Total_Gen_MU"].sum().unstack("Year")
+        growth_pct = annual_totals.pct_change(axis=1) * 100.0
+
+        return {
+            "completeness": completeness,
+            "growth_pct": growth_pct.round(2),
+        }
+
+    def build_monsoon_pivot(self):
+        """Build Region-by-Season pivot table with margins=True (Q8).
+
+        Returns:
+            pd.DataFrame: Pivot table with mean hydro share (%) and total generation (MU).
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        df = self.__data.copy()
+        df["hydro_share_pct"] = (df["Hydro_Gen_MU"] / df["Total_Gen_MU"]) * 100.0
+
+        table = pd.pivot_table(
+            df,
+            index="Region",
+            columns="monsoon_hydro_shift",
+            values=["hydro_share_pct", "Total_Gen_MU"],
+            aggfunc={"hydro_share_pct": "mean", "Total_Gen_MU": "sum"},
+            margins=True,
+        )
+        table.columns = [f"{col[0]}_{col[1]}".lower() for col in table.columns]
+        return table.round(2)
+
+    def rank_top_source_days(self, top_n=5):
+        """Melt generation sources to long format and get top N days per source (Q9).
+
+        Args:
+            top_n (int): Number of peak days per source (default 5).
+
+        Returns:
+            pd.DataFrame: Long-format table of top generation days.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        long_df = pd.melt(
+            self.__data,
+            id_vars=["Date", "Region"],
+            value_vars=["Thermal_Gen_MU", "Nuclear_Gen_MU", "Hydro_Gen_MU"],
+            var_name="Energy_Source",
+            value_name="Generation_MU",
+        )
+        sorted_df = long_df.sort_values(
+            ["Energy_Source", "Generation_MU"], ascending=[True, False]
+        )
+        return sorted_df.groupby("Energy_Source").head(top_n).reset_index(drop=True)
+
+    def southern_aug_vs_may_swing(self):
+        """Compute Southern Region hydro share in August vs May (Viva challenge helper).
+
+        Returns:
+            dict: May hydro %, August hydro %, and percentage swing.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        south = self.__data[self.__data["Region"] == "Southern"].copy()
+        south["hydro_pct"] = (south["Hydro_Gen_MU"] / south["Total_Gen_MU"]) * 100.0
+
+        may_avg = float(south[south["Month"] == 5]["hydro_pct"].mean())
+        aug_avg = float(south[south["Month"] == 8]["hydro_pct"].mean())
+
+        return {
+            "may_hydro_pct": round(may_avg, 2),
+            "aug_hydro_pct": round(aug_avg, 2),
+            "swing_pct": round(aug_avg - may_avg, 2),
+        }
+
+    def summary_report(self):
+        """Return a combined dictionary of main analytical findings.
+
+        Returns:
+            dict: Consolidated metrics from Q4, Q5, Q6, and Southern monsoon swing.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        return {
+            "rows": len(self.__data),
+            "southern_shannon": self.compute_shannon_diversity("Southern"),
+            "mask_summary": self.compare_clean_and_deficit_days(),
+            "ols_model": self.fit_hydro_thermal_ols(),
+            "southern_monsoon_swing": self.southern_aug_vs_may_swing(),
+        }
+
+
+
