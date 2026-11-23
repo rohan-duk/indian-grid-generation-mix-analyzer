@@ -220,3 +220,129 @@ class GridGenerationMixAnalyzer:
         }
 
 
+    def check_completeness_and_growth(self):
+        """Quantify missing regional records and compute annual generation growth (Q7).
+
+        Returns:
+            dict: Completeness summary DataFrame and annual growth DataFrame.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        df = self.__data.copy()
+
+        # Rolling 7-day median baseline on Total_Gen_MU to flag sudden spikes
+        df["rolling_7d_median"] = (
+            df.groupby("Region")["Total_Gen_MU"]
+            .transform(lambda s: s.rolling(window=7, min_periods=1).median())
+        )
+        df["spike_flag"] = df["Total_Gen_MU"] > (1.25 * df["rolling_7d_median"])
+
+        full_days = int((df["Date"].max() - df["Date"].min()).days) + 1
+        completeness = df.groupby("Region").agg(
+            recorded_days=("Date", lambda s: s.dt.date.nunique()),
+            missing_demand_count=("Peak_Demand_MW", lambda s: int(s.isna().sum())),
+            spike_days=("spike_flag", "sum"),
+        )
+        completeness["missing_days"] = (full_days - completeness["recorded_days"]).clip(lower=0)
+
+        annual_totals = df.groupby(["Region", "Year"])["Total_Gen_MU"].sum().unstack("Year")
+        growth_pct = annual_totals.pct_change(axis=1) * 100.0
+
+        return {
+            "completeness": completeness,
+            "growth_pct": growth_pct.round(2),
+        }
+
+    def build_monsoon_pivot(self):
+        """Build Region-by-Season pivot table with margins=True (Q8).
+
+        Returns:
+            pd.DataFrame: Pivot table with mean hydro share (%) and total generation (MU).
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        df = self.__data.copy()
+        df["hydro_share_pct"] = (df["Hydro_Gen_MU"] / df["Total_Gen_MU"]) * 100.0
+
+        table = pd.pivot_table(
+            df,
+            index="Region",
+            columns="monsoon_hydro_shift",
+            values=["hydro_share_pct", "Total_Gen_MU"],
+            aggfunc={"hydro_share_pct": "mean", "Total_Gen_MU": "sum"},
+            margins=True,
+        )
+        table.columns = [f"{col[0]}_{col[1]}".lower() for col in table.columns]
+        return table.round(2)
+
+    def rank_top_source_days(self, top_n=5):
+        """Melt generation sources to long format and get top N days per source (Q9).
+
+        Args:
+            top_n (int): Number of peak days per source (default 5).
+
+        Returns:
+            pd.DataFrame: Long-format table of top generation days.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        long_df = pd.melt(
+            self.__data,
+            id_vars=["Date", "Region"],
+            value_vars=["Thermal_Gen_MU", "Nuclear_Gen_MU", "Hydro_Gen_MU"],
+            var_name="Energy_Source",
+            value_name="Generation_MU",
+        )
+        sorted_df = long_df.sort_values(
+            ["Energy_Source", "Generation_MU"], ascending=[True, False]
+        )
+        return sorted_df.groupby("Energy_Source").head(top_n).reset_index(drop=True)
+
+    def southern_aug_vs_may_swing(self):
+        """Compute Southern Region hydro share in August vs May (Viva challenge helper).
+
+        Returns:
+            dict: May hydro %, August hydro %, and percentage swing.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        south = self.__data[self.__data["Region"] == "Southern"].copy()
+        south["hydro_pct"] = (south["Hydro_Gen_MU"] / south["Total_Gen_MU"]) * 100.0
+
+        may_avg = float(south[south["Month"] == 5]["hydro_pct"].mean())
+        aug_avg = float(south[south["Month"] == 8]["hydro_pct"].mean())
+
+        return {
+            "may_hydro_pct": round(may_avg, 2),
+            "aug_hydro_pct": round(aug_avg, 2),
+            "swing_pct": round(aug_avg - may_avg, 2),
+        }
+
+    def summary_report(self):
+        """Return a combined dictionary of main analytical findings.
+
+        Returns:
+            dict: Consolidated metrics from Q4, Q5, Q6, and Southern monsoon swing.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        return {
+            "rows": len(self.__data),
+            "southern_shannon": self.compute_shannon_diversity("Southern"),
+            "mask_summary": self.compare_clean_and_deficit_days(),
+            "ols_model": self.fit_hydro_thermal_ols(),
+            "southern_monsoon_swing": self.southern_aug_vs_may_swing(),
+        }
+
+
+
