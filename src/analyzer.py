@@ -150,3 +150,76 @@ class GridGenerationMixAnalyzer:
         self._last_shannon = out
         return out
 
+    def compare_clean_and_deficit_days(self, clean_cutoff=0.40, deficit_cutoff=1000.0):
+        """Compare days with clean energy > 40% vs peak deficit > 1000 MW using boolean masks.
+
+        Args:
+            clean_cutoff (float): Clean share threshold (default 0.40).
+            deficit_cutoff (float): Peak deficit threshold in MW (default 1000.0).
+
+        Returns:
+            dict: Counts and percentages of flagged days plus Python set check.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        clean_ratio = self.__data["clean_energy_ratio"].to_numpy(dtype=float)
+        deficit_mw = self.__data["Deficit_MW"].to_numpy(dtype=float)
+
+        mask_clean = clean_ratio > clean_cutoff
+        mask_deficit = deficit_mw > deficit_cutoff
+        mask_both = mask_clean & mask_deficit
+
+        set_clean = set(np.where(mask_clean)[0].tolist())
+        set_deficit = set(np.where(mask_deficit)[0].tolist())
+        set_match = (len(set_clean & set_deficit) == int(np.sum(mask_both)))
+
+        total = len(clean_ratio)
+        return {
+            "total_records": total,
+            "high_clean_count": int(np.sum(mask_clean)),
+            "high_clean_pct": round(float(np.mean(mask_clean) * 100), 2),
+            "high_deficit_count": int(np.sum(mask_deficit)),
+            "high_deficit_pct": round(float(np.mean(mask_deficit) * 100), 2),
+            "both_count": int(np.sum(mask_both)),
+            "set_check_passed": bool(set_match),
+        }
+
+    def fit_hydro_thermal_ols(self):
+        """Fit OLS regression Thermal_Gen = b0 + b1*Hydro_Gen + b2*Peak_Demand.
+
+        Returns:
+            dict: Intercept, slopes, R2 score, RSS, and hydro-thermal elasticity.
+
+        Raises:
+            RuntimeError: If data is not loaded.
+        """
+        self._require_loaded()
+        hydro = self.__data["Hydro_Gen_MU"].to_numpy(dtype=float)
+        demand = self.__data["Peak_Demand_MW"].to_numpy(dtype=float)
+        thermal = self.__data["Thermal_Gen_MU"].to_numpy(dtype=float)
+
+        X = np.column_stack([np.ones(len(hydro)), hydro, demand])
+        beta, _, _, _ = np.linalg.lstsq(X, thermal, rcond=None)
+        preds = X @ beta
+
+        rss = float(np.sum((thermal - preds) ** 2))
+        tss = float(np.sum((thermal - np.mean(thermal)) ** 2))
+        r2 = 1.0 - (rss / tss) if tss > 0 else 0.0
+
+        elasticity = float(beta[1] * (np.mean(hydro) / np.mean(thermal)))
+
+        return {
+            "b0_intercept": round(float(beta[0]), 4),
+            "b1_hydro": round(float(beta[1]), 4),
+            "b2_demand": round(float(beta[2]), 4),
+            "r2": round(r2, 4),
+            "rss": round(rss, 2),
+            "substitution_elasticity": round(elasticity, 4),
+        }
+
+
+    
+
+
