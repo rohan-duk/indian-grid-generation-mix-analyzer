@@ -35,14 +35,14 @@ def main():
 
     print("Step 1: Auditing raw CSV and exporting clean dataset...")
     counts = clean_grid_dataset(args.input, clean_csv, audit_log)
-    print(f"        Total={counts['total']}, Valid={counts['valid']}, Rejected={counts['rejected']}")
+    print(f"Total={counts['total']}, Valid={counts['valid']}, Rejected={counts['rejected']}")
 
     print("Step 2: Running GridGenerationMixAnalyzer models...")
     analyzer = GridGenerationMixAnalyzer(clean_csv)
     report = analyzer.summary_report()
-    print("        Southern Shannon H :", report["southern_shannon"]["mean_h"])
-    print("        OLS R2 Score       :", report["ols_model"]["r2"])
-    print("        Southern Aug-May   :", report["southern_monsoon_swing"])
+    print("Southern Shannon H :", report["southern_shannon"]["mean_h"])
+    print("OLS R2 Score       :", report["ols_model"]["r2"])
+    print("Southern Aug-May   :", report["southern_monsoon_swing"])
 
     print("Step 3: Saving static figures and interactive Plotly HTML...")
     df = analyzer.get_data()
